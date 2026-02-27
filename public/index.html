@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Everand Checker</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f5f5;
+    color: #333;
+    padding: 2rem;
+    max-width: 1100px;
+    margin: 0 auto;
+  }
+  h1 { margin-bottom: 0.25rem; font-size: 1.6rem; }
+  .subtitle { color: #666; margin-bottom: 1.5rem; font-size: 0.95rem; }
+  .upload-area {
+    background: #fff;
+    border: 2px dashed #ccc;
+    border-radius: 8px;
+    padding: 2rem;
+    text-align: center;
+    margin-bottom: 1.5rem;
+    transition: border-color 0.2s;
+  }
+  .upload-area.dragover { border-color: #4a90d9; background: #f0f6ff; }
+  .upload-area input[type="file"] { display: none; }
+  .upload-area label {
+    display: inline-block;
+    background: #4a90d9;
+    color: #fff;
+    padding: 0.6rem 1.5rem;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.95rem;
+  }
+  .upload-area label:hover { background: #3a7bc8; }
+  .upload-area p { margin-top: 0.5rem; font-size: 0.85rem; color: #888; }
+  .status {
+    margin-bottom: 1rem;
+    font-size: 0.95rem;
+    min-height: 1.5em;
+  }
+  .status .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid #ccc;
+    border-top-color: #4a90d9;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    vertical-align: middle;
+    margin-right: 0.4rem;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .actions { margin-bottom: 1rem; }
+  .actions button {
+    background: #2d8a4e;
+    color: #fff;
+    border: none;
+    padding: 0.5rem 1.2rem;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .actions button:hover { background: #247a42; }
+  .actions button:disabled { background: #aaa; cursor: default; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    background: #fff;
+    border-radius: 6px;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+  }
+  th, td {
+    text-align: left;
+    padding: 0.6rem 0.8rem;
+    border-bottom: 1px solid #eee;
+    font-size: 0.9rem;
+  }
+  th { background: #fafafa; font-weight: 600; position: sticky; top: 0; }
+  tr:last-child td { border-bottom: none; }
+  td a { color: #4a90d9; text-decoration: none; }
+  td a:hover { text-decoration: underline; }
+  .tag {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    font-size: 0.8rem;
+    font-weight: 500;
+  }
+  .tag.audiobook { background: #e8f5e9; color: #2e7d32; }
+  .tag.ebook { background: #e3f2fd; color: #1565c0; }
+  .tag.none { background: #fafafa; color: #999; }
+  .not-found { color: #999; }
+  .progress-bar {
+    width: 100%;
+    height: 4px;
+    background: #e0e0e0;
+    border-radius: 2px;
+    margin-bottom: 1rem;
+    display: none;
+  }
+  .progress-bar .fill {
+    height: 100%;
+    background: #4a90d9;
+    border-radius: 2px;
+    transition: width 0.3s;
+    width: 0%;
+  }
+</style>
+</head>
+<body>
+
+<h1>Everand Checker</h1>
+<p class="subtitle">Upload a CSV with Title and Author columns to find Everand audiobook/ebook listings.</p>
+
+<div class="upload-area" id="dropZone">
+  <label for="csvInput">Choose CSV File</label>
+  <input type="file" id="csvInput" accept=".csv">
+  <p>or drag &amp; drop a .csv file here</p>
+</div>
+
+<div class="progress-bar" id="progressBar"><div class="fill" id="progressFill"></div></div>
+<div class="status" id="status"></div>
+
+<div class="actions">
+  <button id="downloadBtn" disabled>Download CSV</button>
+</div>
+
+<table id="resultsTable" style="display:none">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Title</th>
+      <th>Author</th>
+      <th>Everand Link</th>
+      <th>Doc ID</th>
+      <th>Format</th>
+    </tr>
+  </thead>
+  <tbody id="resultsBody"></tbody>
+</table>
+
+<script>
+const csvInput = document.getElementById('csvInput');
+const dropZone = document.getElementById('dropZone');
+const status = document.getElementById('status');
+const progressBar = document.getElementById('progressBar');
+const progressFill = document.getElementById('progressFill');
+const downloadBtn = document.getElementById('downloadBtn');
+const resultsTable = document.getElementById('resultsTable');
+const resultsBody = document.getElementById('resultsBody');
+
+let currentSessionId = null;
+
+// Drag & drop
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file && file.name.endsWith('.csv')) uploadFile(file);
+});
+
+csvInput.addEventListener('change', () => {
+  if (csvInput.files[0]) uploadFile(csvInput.files[0]);
+});
+
+async function uploadFile(file) {
+  // Reset UI
+  resultsBody.innerHTML = '';
+  resultsTable.style.display = 'none';
+  downloadBtn.disabled = true;
+  progressBar.style.display = 'block';
+  progressFill.style.width = '0%';
+  status.innerHTML = '<span class="spinner"></span> Uploading...';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  let res;
+  try {
+    res = await fetch('/api/upload', { method: 'POST', body: form });
+  } catch (err) {
+    status.textContent = 'Upload failed: ' + err.message;
+    progressBar.style.display = 'none';
+    return;
+  }
+
+  const data = await res.json();
+  if (!res.ok) {
+    status.textContent = 'Error: ' + data.error;
+    progressBar.style.display = 'none';
+    return;
+  }
+
+  currentSessionId = data.sessionId;
+  const total = data.total;
+  resultsTable.style.display = '';
+  status.innerHTML = `<span class="spinner"></span> Processing 0 / ${total} books...`;
+
+  // Listen for SSE results
+  const evtSource = new EventSource(`/api/results/${currentSessionId}`);
+  let count = 0;
+
+  evtSource.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'result') {
+      count++;
+      const r = msg.row;
+      const tr = document.createElement('tr');
+
+      const linkCell = r.Everand_Link
+        ? `<a href="${r.Everand_Link}" target="_blank" rel="noopener">${truncate(r.Everand_Link, 50)}</a>`
+        : '<span class="not-found">Not Found</span>';
+
+      const formatCell = r.Format
+        ? `<span class="tag ${r.Format}">${r.Format}</span>`
+        : '<span class="tag none">&mdash;</span>';
+
+      tr.innerHTML = `
+        <td>${count}</td>
+        <td>${esc(r.Title)}</td>
+        <td>${esc(r.Author)}</td>
+        <td>${linkCell}</td>
+        <td>${r.Doc_ID || '<span class="not-found">&mdash;</span>'}</td>
+        <td>${formatCell}</td>
+      `;
+      resultsBody.appendChild(tr);
+
+      const pct = Math.round((count / total) * 100);
+      progressFill.style.width = pct + '%';
+      status.innerHTML = `<span class="spinner"></span> Processing ${count} / ${total} books...`;
+    }
+
+    if (msg.type === 'done') {
+      evtSource.close();
+      progressFill.style.width = '100%';
+      status.textContent = `Done! ${count} books processed.`;
+      downloadBtn.disabled = false;
+    }
+  };
+
+  evtSource.onerror = () => {
+    evtSource.close();
+    if (count < total) {
+      status.textContent = `Connection lost after ${count} / ${total}. Results so far are shown.`;
+    }
+    downloadBtn.disabled = false;
+  };
+}
+
+downloadBtn.addEventListener('click', () => {
+  if (currentSessionId) {
+    window.location.href = `/api/download/${currentSessionId}`;
+  }
+});
+
+function esc(str) {
+  const d = document.createElement('div');
+  d.textContent = str;
+  return d.innerHTML;
+}
+
+function truncate(str, n) {
+  return str.length > n ? str.slice(0, n) + '...' : str;
+}
+</script>
+</body>
+</html>
