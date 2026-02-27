@@ -150,6 +150,24 @@
     border-radius: 4px;
     font-size: 0.85rem;
   }
+  .col-picker {
+    display: flex;
+    gap: 0.5rem 1.2rem;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 0 1rem 1rem;
+  }
+  .col-picker label {
+    flex: unset;
+    min-width: unset;
+    flex-direction: row;
+    align-items: center;
+    gap: 0.35rem;
+    cursor: pointer;
+    font-size: 0.85rem;
+    color: #555;
+  }
+  .col-picker input[type="checkbox"]:disabled { opacity: 0.5; }
 </style>
 </head>
 <body>
@@ -176,6 +194,17 @@
       Delay between requests (ms)
       <input type="number" id="delayInput" value="1500" min="500" max="10000" step="100">
     </label>
+  </div>
+</details>
+
+<details class="settings">
+  <summary>CSV Download Columns</summary>
+  <div class="col-picker" id="colPicker">
+    <label><input type="checkbox" value="Title" checked disabled> Title</label>
+    <label><input type="checkbox" value="Author" checked disabled> Author</label>
+    <label><input type="checkbox" value="Everand_Link" checked> Everand_Link</label>
+    <label><input type="checkbox" value="Doc_ID" checked> Doc_ID</label>
+    <label><input type="checkbox" value="Format" checked> Format</label>
   </div>
 </details>
 
@@ -443,12 +472,18 @@ async function processFile(file) {
   csvInput.value = '';
 }
 
+function getSelectedColumns() {
+  return [...document.querySelectorAll('#colPicker input[type="checkbox"]:checked')]
+    .map(cb => cb.value);
+}
+
 downloadBtn.addEventListener('click', () => {
   if (results.length === 0) return;
-  const header = 'Title,Author,Everand_Link,Doc_ID,Format';
+  const cols = getSelectedColumns();
+  if (cols.length === 0) return;
+  const header = cols.join(',');
   const csvRows = results.map((r) =>
-    [r.Title, r.Author, r.Everand_Link || '', r.Doc_ID || '', r.Format || '']
-      .map((v) => `"${(v || '').replace(/"/g, '""')}"`)
+    cols.map((col) => `"${(String(r[col] || '')).replace(/"/g, '""')}"`)
       .join(',')
   );
   const csvContent = header + '\n' + csvRows.join('\n');
