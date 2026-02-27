@@ -75,6 +75,8 @@ async function searchEverand(title, author) {
         link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
         docId: String(doc.id),
         format: 'audiobook',
+        title: doc.title || null,
+        author: (doc.author && doc.author.name) || null,
       };
     }
   }
@@ -86,6 +88,8 @@ async function searchEverand(title, author) {
       link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
       docId: String(doc.id),
       format: 'audiobook',
+      title: doc.title || null,
+      author: (doc.author && doc.author.name) || null,
     };
   }
 
@@ -109,6 +113,8 @@ async function searchEverand(title, author) {
           link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
           docId: String(doc.id),
           format: 'ebook',
+          title: doc.title || null,
+          author: (doc.author && doc.author.name) || null,
         };
       }
     }
@@ -119,11 +125,13 @@ async function searchEverand(title, author) {
         link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
         docId: String(doc.id),
         format: 'ebook',
+        title: doc.title || null,
+        author: (doc.author && doc.author.name) || null,
       };
     }
   }
 
-  return { link: null, docId: null, format: null };
+  return { link: null, docId: null, format: null, title: null, author: null };
 }
 
 // Sleep helper
@@ -176,8 +184,8 @@ async function processSession(sessionId) {
     }
 
     session.results.push({
-      Title,
-      Author,
+      Title: result.title || Title,
+      Author: result.author || Author,
       Everand_Link: result.link,
       Doc_ID: result.docId,
       Format: result.format,
