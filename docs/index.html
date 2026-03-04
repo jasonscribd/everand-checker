@@ -297,7 +297,17 @@ function parseCSV(file) {
             for (const key of Object.keys(row)) {
               norm[key.trim().toLowerCase()] = (row[key] || '').trim();
             }
-            return { Title: norm['title'] || '', Author: norm['author'] || '' };
+            let author = norm['author'] || '';
+            // Handle JSON array format like ["Author Name"] or ["Author1","Author2"]
+            if (author.startsWith('[')) {
+              try {
+                const parsed = JSON.parse(author.replace(/\u201C|\u201D/g, '"'));
+                author = Array.isArray(parsed) ? parsed.join(', ') : author;
+              } catch {
+                author = author.replace(/[\[\]"]+/g, '').trim();
+              }
+            }
+            return { Title: norm['title'] || '', Author: author };
           })
           .filter((r) => r.Title);
         resolve(rows);

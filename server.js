@@ -28,7 +28,16 @@ function parseCSV(buffer) {
           normalized[key.trim().toLowerCase()] = row[key].trim();
         }
         const title = normalized['title'] || '';
-        const author = normalized['author'] || '';
+        let author = normalized['author'] || '';
+        // Handle JSON array format like ["Author Name"] or ["Author1","Author2"]
+        if (author.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(author.replace(/\u201C|\u201D/g, '"'));
+            author = Array.isArray(parsed) ? parsed.join(', ') : author;
+          } catch {
+            author = author.replace(/[\[\]"]+/g, '').trim();
+          }
+        }
         if (title) results.push({ Title: title, Author: author });
       })
       .on('end', () => resolve(results))
