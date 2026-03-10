@@ -14,13 +14,15 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Store results per session (simple in-memory store keyed by upload id)
 const sessions = new Map();
 
-// Parse CSV buffer into array of {Title, Author}
+// Parse CSV buffer into array of {title, author, originalRow}, plus headers list
 function parseCSV(buffer) {
   return new Promise((resolve, reject) => {
-    const results = [];
+    const rows = [];
+    let headers = null;
     const stream = Readable.from(buffer.toString());
     stream
       .pipe(csv())
+      .on('headers', (hdrs) => { headers = hdrs; })
       .on('data', (row) => {
         // Normalize column names — handle various casings/spacings
         const normalized = {};
@@ -38,9 +40,9 @@ function parseCSV(buffer) {
             author = author.replace(/[\[\]"]+/g, '').trim();
           }
         }
-        if (title) results.push({ Title: title, Author: author });
+        if (title) rows.push({ title, author, originalRow: row });
       })
-      .on('end', () => resolve(results))
+      .on('end', () => resolve({ rows, headers: headers || [] }))
       .on('error', reject);
   });
 }
@@ -153,7 +155,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
   try {
-    const rows = await parseCSV(req.file.buffer);
+    const { rows, headers } = await parseCSV(req.file.buffer);
     if (rows.length === 0) {
       return res.status(400).json({ error: 'CSV has no valid rows. Ensure columns "Title" and "Author" exist.' });
     }
@@ -161,6 +163,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     sessions.set(sessionId, {
       rows,
+      headers,
       results: [],
       done: false,
     });
@@ -181,24 +184,36 @@ async function processSession(sessionId) {
   if (!session) return;
 
   for (let i = 0; i < session.rows.length; i++) {
-    const { Title, Author } = session.rows[i];
-    console.log(`[${i + 1}/${session.rows.length}] Searching: "${Title}" by ${Author}`);
+    const { title, author, originalRow } = session.rows[i];
+    console.log(`[${i + 1}/${session.rows.length}] Searching: "${title}" by ${author}`);
 
     let result;
     try {
-      result = await searchEverand(Title, Author);
+      result = await searchEverand(title, author);
     } catch (err) {
-      console.error(`  Error searching for "${Title}":`, err.message);
+      console.error(`  Error searching for "${title}":`, err.message);
       result = { link: null, docId: null, format: null };
     }
 
-    session.results.push({
-      Title: result.title || Title,
-      Author: result.author || Author,
-      Everand_Link: result.link,
-      Doc_ID: result.docId,
-      Format: result.format,
-    });
+    // Start with all original columns preserved
+    const resultRow = { ...originalRow };
+
+    // Apply Everand's title/author spelling if a match was found
+    const titleKey = Object.keys(originalRow).find(k => k.trim().toLowerCase() === 'title');
+    const authorKey = Object.keys(originalRow).find(k => k.trim().toLowerCase() === 'author');
+    if (titleKey) resultRow[titleKey] = result.title || title;
+    if (authorKey) resultRow[authorKey] = result.author || author;
+
+    // Also set canonical Title/Author for the frontend display
+    resultRow.Title = result.title || title;
+    resultRow.Author = result.author || author;
+
+    // Append Everand columns
+    resultRow.Everand_Link = result.link || '';
+    resultRow.Doc_ID = result.docId || '';
+    resultRow.Format = result.format || '';
+
+    session.results.push(resultRow);
 
     // Delay between searches (skip after last)
     if (i < session.rows.length - 1) {
@@ -252,7 +267,14 @@ app.get('/api/download/:sessionId', (req, res) => {
   const session = sessions.get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: 'Session not found' });
 
-  const fields = ['Title', 'Author', 'Everand_Link', 'Doc_ID', 'Format'];
+  // Build field list: original CSV columns (in original order) + Everand columns appended
+  const everandFields = ['Everand_Link', 'Doc_ID', 'Format'];
+  const originalHeaders = (session.headers || []).filter(h => !everandFields.includes(h));
+  // Deduplicate: if original CSV already had canonical Title/Author, don't double-add
+  const seen = new Set(originalHeaders.map(h => h.trim().toLowerCase()));
+  const extraCanonical = ['Title', 'Author'].filter(h => !seen.has(h.toLowerCase()));
+  const fields = [...originalHeaders, ...extraCanonical, ...everandFields];
+
   const parser = new Json2CsvParser({ fields });
   const csvData = parser.parse(session.results);
 
