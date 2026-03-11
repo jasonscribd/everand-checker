@@ -291,6 +291,7 @@ function parseCSV(file) {
       header: true,
       skipEmptyLines: true,
       complete: (res) => {
+        const headers = res.meta.fields || [];
         const rows = res.data
           .map((row) => {
             const norm = {};
@@ -307,10 +308,10 @@ function parseCSV(file) {
                 author = author.replace(/[\[\]"]+/g, '').trim();
               }
             }
-            return { Title: norm['title'] || '', Author: author };
+            return { title: norm['title'] || '', author, originalRow: row };
           })
-          .filter((r) => r.Title);
-        resolve(rows);
+          .filter((r) => r.title);
+        resolve({ rows, headers });
       },
       error: reject,
     });
@@ -413,9 +414,9 @@ async function processFile(file) {
   progressFill.style.width = '0%';
   statusEl.innerHTML = '<span class="spinner"></span> Parsing CSV...';
 
-  let rows;
+  let parsed;
   try {
-    rows = await parseCSV(file);
+    parsed = await parseCSV(file);
   } catch (err) {
     statusEl.textContent = 'Failed to parse CSV: ' + err.message;
     progressBar.style.display = 'none';
@@ -423,11 +424,31 @@ async function processFile(file) {
     return;
   }
 
+  const { rows, headers } = parsed;
+
   if (rows.length === 0) {
     statusEl.textContent = 'No valid rows found. Ensure your CSV has "Title" and "Author" columns.';
     progressBar.style.display = 'none';
     cancelBtn.style.display = 'none';
     return;
+  }
+
+  // Rebuild column picker: original CSV columns (in order) + Everand columns
+  const everandCols = ['Everand_Link', 'Doc_ID', 'Format'];
+  const knownLower = new Set(['title', 'author', ...everandCols.map(c => c.toLowerCase())]);
+  const extraCols = headers.filter(h => !knownLower.has(h.trim().toLowerCase()));
+  const colOrder = [
+    ...headers.filter(h => ['title', 'author'].includes(h.trim().toLowerCase())),
+    ...extraCols,
+    ...everandCols,
+  ];
+  const colPicker = document.getElementById('colPicker');
+  colPicker.innerHTML = '';
+  for (const col of colOrder) {
+    const isRequired = ['title', 'author'].includes(col.trim().toLowerCase());
+    const label = document.createElement('label');
+    label.innerHTML = `<input type="checkbox" value="${col}"${isRequired ? ' disabled' : ''} checked> ${col}`;
+    colPicker.appendChild(label);
   }
 
   const total = rows.length;
@@ -440,18 +461,22 @@ async function processFile(file) {
       break;
     }
 
-    const { Title, Author } = rows[i];
-    statusEl.innerHTML = `<span class="spinner"></span> (${i + 1}/${total}) Searching: ${esc(Title)}...`;
+    const { title, author, originalRow } = rows[i];
+    statusEl.innerHTML = `<span class="spinner"></span> (${i + 1}/${total}) Searching: ${esc(title)}...`;
 
-    const result = await searchEverand(Title, Author);
+    const result = await searchEverand(title, author);
 
-    const row = {
-      Title: result.title || Title,
-      Author: result.author || Author,
-      Everand_Link: result.link,
-      Doc_ID: result.docId,
-      Format: result.format,
-    };
+    // Preserve all original columns, then add/update Everand fields
+    const row = { ...originalRow };
+    const titleKey = Object.keys(originalRow).find(k => k.trim().toLowerCase() === 'title');
+    const authorKey = Object.keys(originalRow).find(k => k.trim().toLowerCase() === 'author');
+    if (titleKey) row[titleKey] = result.title || title;
+    if (authorKey) row[authorKey] = result.author || author;
+    row.Title = result.title || title;
+    row.Author = result.author || author;
+    row.Everand_Link = result.link;
+    row.Doc_ID = result.docId;
+    row.Format = result.format;
     results.push(row);
 
     // Append to table
