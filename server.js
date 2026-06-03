@@ -65,7 +65,15 @@ function normStr(s) {
 function tokenize(s) {
   return normStr(s).split(' ').filter((w) => w && w.length > 1 && !MATCH_STOP.has(w));
 }
+// Knock-off products that reuse a book's title: third-party summaries,
+// workbooks, study guides, etc. Reject these even though their title contains
+// all the real title's words.
+const IMPOSTER_RE = /\b(summary|workbook|study guide|analysis|companion|conversation starters|key takeaways|guide to)\b/i;
 function matchScore(qTitle, qAuthor, doc) {
+  const rawDocTitle = (doc.title || '').toLowerCase();
+  const rawQueryTitle = (qTitle || '').toLowerCase();
+  if (IMPOSTER_RE.test(rawDocTitle) && !IMPOSTER_RE.test(rawQueryTitle)) return 0;
+
   const qt = tokenize(qTitle);
   const dt = new Set(tokenize(doc.title));
   if (qt.length === 0 || dt.size === 0) return 0;
@@ -120,9 +128,6 @@ async function fetchEverandJSON(url, headers) {
 
 // Search Everand's own API for a title+author match
 async function searchEverand(title, author) {
-  const query = `${title} ${author}`;
-  const apiUrl = `https://www.everand.com/search/query?query=${encodeURIComponent(query)}`;
-
   const headers = {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/plain, */*',
@@ -135,33 +140,36 @@ async function searchEverand(title, author) {
   };
   if (EVERAND_COOKIE) headers['Cookie'] = EVERAND_COOKIE;
 
-  try {
-    // Prefer audiobook.
-    const data = await fetchEverandJSON(apiUrl, headers);
-    const audiobooks = data.results?.audiobooks?.content?.documents || [];
-    const abMatch = pickBest(title, author, audiobooks);
-    if (abMatch) {
-      return {
-        link: abMatch.book_preview_url || `https://www.everand.com/audiobook/${abMatch.id}`,
-        docId: String(abMatch.id),
-        format: 'audiobook',
-        title: abMatch.title || null,
-        author: (abMatch.author && abMatch.author.name) || null,
-      };
-    }
+  const abResult = (doc) => ({
+    link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
+    docId: String(doc.id), format: 'audiobook',
+    title: doc.title || null, author: (doc.author && doc.author.name) || null,
+  });
+  const ebResult = (doc) => ({
+    link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
+    docId: String(doc.id), format: 'ebook',
+    title: doc.title || null, author: (doc.author && doc.author.name) || null,
+  });
 
-    // Fallback: ebook.
-    const booksData = await fetchEverandJSON(apiUrl + '&content_type=books', headers);
-    const books = booksData.results?.books?.content?.documents || [];
-    const ebMatch = pickBest(title, author, books);
-    if (ebMatch) {
-      return {
-        link: ebMatch.book_preview_url || `https://www.everand.com/book/${ebMatch.id}`,
-        docId: String(ebMatch.id),
-        format: 'ebook',
-        title: ebMatch.title || null,
-        author: (ebMatch.author && ebMatch.author.name) || null,
-      };
+  // Search by TITLE first. Adding the author to the query string hurts ranking
+  // on titles where the author name pulls in summaries/knock-offs (e.g. the
+  // real "Everything Is Tuberculosis" gets buried under "Summary of John
+  // Green's..."). Fall back to title+author only if title-only finds nothing.
+  const queries = author ? [title, `${title} ${author}`.trim()] : [title];
+
+  try {
+    for (const q of queries) {
+      const apiUrl = `https://www.everand.com/search/query?query=${encodeURIComponent(q)}`;
+
+      const data = await fetchEverandJSON(apiUrl, headers);
+      const audiobooks = data.results?.audiobooks?.content?.documents || [];
+      const abMatch = pickBest(title, author, audiobooks);
+      if (abMatch) return abResult(abMatch);
+
+      const booksData = await fetchEverandJSON(apiUrl + '&content_type=books', headers);
+      const books = booksData.results?.books?.content?.documents || [];
+      const ebMatch = pickBest(title, author, books);
+      if (ebMatch) return ebResult(ebMatch);
     }
   } catch (err) {
     console.error(`  Error searching "${title}": ${err.message}`);

@@ -342,7 +342,18 @@ function tokenize(s) {
 // Score how well a doc matches the requested title+author. Higher is better;
 // 0 means "not a match". This lets us pick the best of several candidates
 // instead of only accepting an exact substring or a lone single result.
+// Knock-off products that reuse a book's title: third-party summaries,
+// workbooks, study guides, "conversation starters", etc. These are NOT the
+// book the user listed, so reject them outright even though their title
+// contains all the real title's words.
+const IMPOSTER_RE = /\b(summary|workbook|study guide|analysis|companion|conversation starters|key takeaways|guide to)\b/i;
 function matchScore(qTitle, qAuthor, doc) {
+  const rawDocTitle = (doc.title || '').toLowerCase();
+  const rawQueryTitle = (qTitle || '').toLowerCase();
+  // Only treat it as an imposter if the marker is in the doc title but NOT in
+  // what the user actually asked for (so "A Grim Reaper's Guide..." still works).
+  if (IMPOSTER_RE.test(rawDocTitle) && !IMPOSTER_RE.test(rawQueryTitle)) return 0;
+
   const qt = tokenize(qTitle);
   const dt = new Set(tokenize(doc.title));
   if (qt.length === 0 || dt.size === 0) return 0;
@@ -397,37 +408,46 @@ async function fetchJSON(url, { timeoutMs = 12000, retries = 1 } = {}) {
   }
 }
 
+function abResult(doc) {
+  return {
+    link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
+    docId: String(doc.id), format: 'audiobook',
+    title: doc.title || null, author: (doc.author && doc.author.name) || null,
+  };
+}
+function ebResult(doc) {
+  return {
+    link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
+    docId: String(doc.id), format: 'ebook',
+    title: doc.title || null, author: (doc.author && doc.author.name) || null,
+  };
+}
+
 async function searchEverand(title, author) {
-  const query = `${title} ${author}`;
-  const apiUrl = `https://www.everand.com/search/query?query=${encodeURIComponent(query)}`;
+  // Search by TITLE first. Adding the author to the query string hurts ranking
+  // on titles where the author name pulls in summaries/knock-offs (e.g. the
+  // real "Everything Is Tuberculosis" gets buried under "Summary of John
+  // Green's..."). We only fall back to a title+author query if title-only
+  // finds nothing — the author check still happens in matchScore either way.
+  const queries = [title, `${title} ${author}`.trim()];
 
   try {
-    // Search default (returns audiobooks + tops). Prefer audiobook.
-    const data = await fetchJSON(apiUrl);
-    const audiobooks = data.results?.audiobooks?.content?.documents || [];
-    const abMatch = pickBest(title, author, audiobooks);
-    if (abMatch) {
-      return {
-        link: abMatch.book_preview_url || `https://www.everand.com/audiobook/${abMatch.id}`,
-        docId: String(abMatch.id),
-        format: 'audiobook',
-        title: abMatch.title || null,
-        author: (abMatch.author && abMatch.author.name) || null,
-      };
-    }
+    for (const q of queries) {
+      const apiUrl = `https://www.everand.com/search/query?query=${encodeURIComponent(q)}`;
 
-    // Fallback: ebook.
-    const booksData = await fetchJSON(apiUrl + '&content_type=books');
-    const books = booksData.results?.books?.content?.documents || [];
-    const ebMatch = pickBest(title, author, books);
-    if (ebMatch) {
-      return {
-        link: ebMatch.book_preview_url || `https://www.everand.com/book/${ebMatch.id}`,
-        docId: String(ebMatch.id),
-        format: 'ebook',
-        title: ebMatch.title || null,
-        author: (ebMatch.author && ebMatch.author.name) || null,
-      };
+      // Prefer audiobook.
+      const data = await fetchJSON(apiUrl);
+      const audiobooks = data.results?.audiobooks?.content?.documents || [];
+      const abMatch = pickBest(title, author, audiobooks);
+      if (abMatch) return abResult(abMatch);
+
+      // Fallback: ebook.
+      const booksData = await fetchJSON(apiUrl + '&content_type=books');
+      const books = booksData.results?.books?.content?.documents || [];
+      const ebMatch = pickBest(title, author, books);
+      if (ebMatch) return ebResult(ebMatch);
+
+      if (!author) break;   // no author to add — second query would be identical
     }
   } catch (err) {
     console.error(`Error searching "${title}":`, err);
