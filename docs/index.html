@@ -195,6 +195,11 @@
       <input type="number" id="delayInput" value="1500" min="500" max="10000" step="100">
     </label>
   </div>
+  <div class="inner" style="flex-direction:column; align-items:stretch;">
+    <p style="font-size:0.85rem; color:#888;">
+      <strong>Note:</strong> Everand now requires authentication cookies to return results. Browsers block JavaScript from setting cookies on cross-origin requests, so this version may not work. Use the <a href="https://github.com/jasonb/everand-checker" style="color:#4a90d9;">local Node.js server</a> instead and run it with <code>EVERAND_COOKIE="..." node server.js</code>.
+    </p>
+  </div>
 </details>
 
 <details class="settings">
@@ -318,79 +323,110 @@ function parseCSV(file) {
   });
 }
 
-async function fetchJSON(url) {
+// ---- Title/author matching helpers ----
+// Catalog titles differ from how people write them: "&" vs "and", appended
+// subtitles (": A Novel", ", Book 1"), curly apostrophes, reordered words.
+// A naive substring check ("one string contains the other") misses all of
+// these, which is the main reason real titles came back as "none".
+const STOP = new Set(['the','a','an','of','and','to','in','is','for','on','with','at','by','novel','book','unabridged','audiobook']);
+function normStr(s) {
+  return (s || '').toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[‘’']/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function tokenize(s) {
+  return normStr(s).split(' ').filter(w => w && w.length > 1 && !STOP.has(w));
+}
+// Score how well a doc matches the requested title+author. Higher is better;
+// 0 means "not a match". This lets us pick the best of several candidates
+// instead of only accepting an exact substring or a lone single result.
+function matchScore(qTitle, qAuthor, doc) {
+  const qt = tokenize(qTitle);
+  const dt = new Set(tokenize(doc.title));
+  if (qt.length === 0 || dt.size === 0) return 0;
+  const present = qt.filter(w => dt.has(w)).length;
+  const titleCoverage = present / qt.length;          // how many query words are in the doc title
+  if (titleCoverage < 0.7) return 0;                  // require most title words to be present
+
+  let authorScore = 0.5;                              // neutral if no author given
+  const qa = tokenize(qAuthor);
+  if (qa.length) {
+    const da = new Set(tokenize((doc.author && doc.author.name) || ''));
+    const last = qa[qa.length - 1];
+    if (da.has(last)) authorScore = 1;                // surname match — strong
+    else if (qa.some(w => da.has(w))) authorScore = 0.8;
+    else authorScore = 0;                             // author given but doesn't match → reject
+  }
+  if (authorScore === 0) return 0;
+  return titleCoverage * 2 + authorScore;
+}
+function pickBest(qTitle, qAuthor, docs) {
+  let best = null, bestScore = 0;
+  for (const doc of docs) {
+    const s = matchScore(qTitle, qAuthor, doc);
+    if (s > bestScore) { best = doc; bestScore = s; }
+  }
+  return best;
+}
+
+// fetch with a timeout + one retry, so a slow/stalled proxy request can't
+// hang the whole run indefinitely.
+async function fetchJSON(url, { timeoutMs = 12000, retries = 1 } = {}) {
   const proxy = getProxyPrefix();
   const proxied = proxy + encodeURIComponent(url);
-  const res = await fetch(proxied, {
-    headers: { 'Accept': 'application/json' },
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.json();
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(proxied, { headers: { 'Accept': 'application/json' }, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const text = await res.text();
+      if (!text || text.trim()[0] !== '{') {
+        // Empty body or HTML (bot challenge / proxy failure) — not usable JSON.
+        throw new Error('non-JSON response (proxy blocked or empty)');
+      }
+      return JSON.parse(text);
+    } catch (err) {
+      clearTimeout(timer);
+      if (attempt === retries) throw err;
+      await sleep(800);   // brief backoff before the retry
+    }
+  }
 }
 
 async function searchEverand(title, author) {
   const query = `${title} ${author}`;
   const apiUrl = `https://www.everand.com/search/query?query=${encodeURIComponent(query)}`;
-  const titleLower = title.toLowerCase();
-  const authorLower = author.toLowerCase();
-
-  function isMatch(doc) {
-    const dt = (doc.title || '').toLowerCase();
-    const da = ((doc.author && doc.author.name) || '').toLowerCase();
-    return (dt.includes(titleLower) || titleLower.includes(dt)) &&
-           (da.includes(authorLower) || authorLower.includes(da));
-  }
 
   try {
-    // Search default (returns audiobooks + tops)
+    // Search default (returns audiobooks + tops). Prefer audiobook.
     const data = await fetchJSON(apiUrl);
     const audiobooks = data.results?.audiobooks?.content?.documents || [];
-
-    for (const doc of audiobooks) {
-      if (isMatch(doc)) {
-        return {
-          link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
-          docId: String(doc.id),
-          format: 'audiobook',
-          title: doc.title || null,
-          author: (doc.author && doc.author.name) || null,
-        };
-      }
-    }
-    if (audiobooks.length === 1) {
-      const doc = audiobooks[0];
+    const abMatch = pickBest(title, author, audiobooks);
+    if (abMatch) {
       return {
-        link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
-        docId: String(doc.id),
+        link: abMatch.book_preview_url || `https://www.everand.com/audiobook/${abMatch.id}`,
+        docId: String(abMatch.id),
         format: 'audiobook',
-        title: doc.title || null,
-        author: (doc.author && doc.author.name) || null,
+        title: abMatch.title || null,
+        author: (abMatch.author && abMatch.author.name) || null,
       };
     }
 
-    // Fallback: search books
+    // Fallback: ebook.
     const booksData = await fetchJSON(apiUrl + '&content_type=books');
     const books = booksData.results?.books?.content?.documents || [];
-
-    for (const doc of books) {
-      if (isMatch(doc)) {
-        return {
-          link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
-          docId: String(doc.id),
-          format: 'ebook',
-          title: doc.title || null,
-          author: (doc.author && doc.author.name) || null,
-        };
-      }
-    }
-    if (books.length === 1) {
-      const doc = books[0];
+    const ebMatch = pickBest(title, author, books);
+    if (ebMatch) {
       return {
-        link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
-        docId: String(doc.id),
+        link: ebMatch.book_preview_url || `https://www.everand.com/book/${ebMatch.id}`,
+        docId: String(ebMatch.id),
         format: 'ebook',
-        title: doc.title || null,
-        author: (doc.author && doc.author.name) || null,
+        title: ebMatch.title || null,
+        author: (ebMatch.author && ebMatch.author.name) || null,
       };
     }
   } catch (err) {

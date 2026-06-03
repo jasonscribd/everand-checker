@@ -47,99 +47,124 @@ function parseCSV(buffer) {
   });
 }
 
+const EVERAND_COOKIE = (process.env.EVERAND_COOKIE || '').replace(/[\r\n]+/g, ' ').trim();
+
+// ---- Title/author matching helpers ----
+// Catalog titles differ from how people write them: "&" vs "and", appended
+// subtitles (": A Novel", ", Book 1"), curly apostrophes, reordered words.
+// A naive substring check misses all of these, which is the main reason real
+// titles came back as "none".
+const MATCH_STOP = new Set(['the','a','an','of','and','to','in','is','for','on','with','at','by','novel','book','unabridged','audiobook']);
+function normStr(s) {
+  return (s || '').toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[‘’']/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+function tokenize(s) {
+  return normStr(s).split(' ').filter((w) => w && w.length > 1 && !MATCH_STOP.has(w));
+}
+function matchScore(qTitle, qAuthor, doc) {
+  const qt = tokenize(qTitle);
+  const dt = new Set(tokenize(doc.title));
+  if (qt.length === 0 || dt.size === 0) return 0;
+  const present = qt.filter((w) => dt.has(w)).length;
+  const titleCoverage = present / qt.length;
+  if (titleCoverage < 0.7) return 0;
+
+  let authorScore = 0.5;
+  const qa = tokenize(qAuthor);
+  if (qa.length) {
+    const da = new Set(tokenize((doc.author && doc.author.name) || ''));
+    const last = qa[qa.length - 1];
+    if (da.has(last)) authorScore = 1;
+    else if (qa.some((w) => da.has(w))) authorScore = 0.8;
+    else authorScore = 0;
+  }
+  if (authorScore === 0) return 0;
+  return titleCoverage * 2 + authorScore;
+}
+function pickBest(qTitle, qAuthor, docs) {
+  let best = null;
+  let bestScore = 0;
+  for (const doc of docs) {
+    const s = matchScore(qTitle, qAuthor, doc);
+    if (s > bestScore) { best = doc; bestScore = s; }
+  }
+  return best;
+}
+
+// fetch JSON with a timeout + one retry so a stalled request can't hang the run.
+async function fetchEverandJSON(url, headers) {
+  for (let attempt = 0; attempt <= 1; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const res = await fetch(url, { headers, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const ct = res.headers.get('content-type') || '';
+      const text = await res.text();
+      if (!ct.includes('json') && text.trim()[0] !== '{') {
+        throw new Error('non-JSON response (bot challenge / cookie missing or expired)');
+      }
+      return JSON.parse(text);
+    } catch (err) {
+      clearTimeout(timer);
+      if (attempt === 1) throw err;
+      await sleep(800);
+    }
+  }
+}
+
 // Search Everand's own API for a title+author match
 async function searchEverand(title, author) {
   const query = `${title} ${author}`;
   const apiUrl = `https://www.everand.com/search/query?query=${encodeURIComponent(query)}`;
 
-  const res = await fetch(apiUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-      'Accept': 'application/json',
-    },
-  });
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Referer': 'https://www.everand.com/search',
+    'sec-fetch-dest': 'empty',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-site': 'same-origin',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+  if (EVERAND_COOKIE) headers['Cookie'] = EVERAND_COOKIE;
 
-  if (!res.ok) {
-    console.error(`  Everand API returned ${res.status} for "${title}"`);
-    return { link: null, docId: null, format: null };
-  }
-
-  const data = await res.json();
-  const titleLower = title.toLowerCase();
-  const authorLower = author.toLowerCase();
-
-  // Helper: check if a document is a likely match by title/author
-  function isMatch(doc) {
-    const docTitle = (doc.title || '').toLowerCase();
-    const docAuthor = (doc.author && doc.author.name || '').toLowerCase();
-    // Check title similarity — one contains the other (handles subtitle differences)
-    const titleMatch = docTitle.includes(titleLower) || titleLower.includes(docTitle);
-    const authorMatch = docAuthor.includes(authorLower) || authorLower.includes(docAuthor);
-    return titleMatch && authorMatch;
-  }
-
-  // Priority 1: audiobook results — look for a title+author match
-  const audiobooks = data.results?.audiobooks?.content?.documents || [];
-  for (const doc of audiobooks) {
-    if (isMatch(doc)) {
+  try {
+    // Prefer audiobook.
+    const data = await fetchEverandJSON(apiUrl, headers);
+    const audiobooks = data.results?.audiobooks?.content?.documents || [];
+    const abMatch = pickBest(title, author, audiobooks);
+    if (abMatch) {
       return {
-        link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
-        docId: String(doc.id),
+        link: abMatch.book_preview_url || `https://www.everand.com/audiobook/${abMatch.id}`,
+        docId: String(abMatch.id),
         format: 'audiobook',
-        title: doc.title || null,
-        author: (doc.author && doc.author.name) || null,
+        title: abMatch.title || null,
+        author: (abMatch.author && abMatch.author.name) || null,
       };
     }
-  }
 
-  // Priority 2: any audiobook result if only one came back (likely correct)
-  if (audiobooks.length === 1) {
-    const doc = audiobooks[0];
-    return {
-      link: doc.book_preview_url || `https://www.everand.com/audiobook/${doc.id}`,
-      docId: String(doc.id),
-      format: 'audiobook',
-      title: doc.title || null,
-      author: (doc.author && doc.author.name) || null,
-    };
-  }
-
-  // Priority 3: book/ebook results — fetch with content_type=books
-  const booksRes = await fetch(
-    `https://www.everand.com/search/query?query=${encodeURIComponent(query)}&content_type=books`,
-    {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-      },
-    }
-  );
-
-  if (booksRes.ok) {
-    const booksData = await booksRes.json();
+    // Fallback: ebook.
+    const booksData = await fetchEverandJSON(apiUrl + '&content_type=books', headers);
     const books = booksData.results?.books?.content?.documents || [];
-    for (const doc of books) {
-      if (isMatch(doc)) {
-        return {
-          link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
-          docId: String(doc.id),
-          format: 'ebook',
-          title: doc.title || null,
-          author: (doc.author && doc.author.name) || null,
-        };
-      }
-    }
-    // Fallback: single book result
-    if (books.length === 1) {
-      const doc = books[0];
+    const ebMatch = pickBest(title, author, books);
+    if (ebMatch) {
       return {
-        link: doc.book_preview_url || `https://www.everand.com/book/${doc.id}`,
-        docId: String(doc.id),
+        link: ebMatch.book_preview_url || `https://www.everand.com/book/${ebMatch.id}`,
+        docId: String(ebMatch.id),
         format: 'ebook',
-        title: doc.title || null,
-        author: (doc.author && doc.author.name) || null,
+        title: ebMatch.title || null,
+        author: (ebMatch.author && ebMatch.author.name) || null,
       };
     }
+  } catch (err) {
+    console.error(`  Error searching "${title}": ${err.message}`);
   }
 
   return { link: null, docId: null, format: null, title: null, author: null };
